@@ -1,9 +1,11 @@
 """pyGearTrain Studio: an interactive GUI around pygeartrain.
 
 Pick a gear train, tune its tooth counts and profile parameters, choose which
-members are input / output / fixed, and watch it run. Extra tabs show the
-symbolic kinematics and sweep the gear ratio over tooth-count ranges.
+members are input / output / fixed, and watch it run in 2D or 3D. Extra tabs show
+the symbolic kinematics and sweep the gear ratio over tooth-count ranges.
 """
+import ctypes
+import json
 import os
 import sys
 import time
@@ -30,6 +32,9 @@ from matplotlib.mathtext import MathTextParser
 import matplotlib.ticker
 
 from pygeartrain import planetary, compound_planetary, cycloid, compound_cycloid, nabtesco, simple
+from viewer3d import Gear3DView
+
+__version__ = '1.1.0'
 
 
 # ----------------------------------------------------------------------------
@@ -37,7 +42,8 @@ from pygeartrain import planetary, compound_planetary, cycloid, compound_cycloid
 # ----------------------------------------------------------------------------
 
 Param = namedtuple('Param', 'name label kind default lo hi step choices', defaults=(None, None, None, None))
-Comp = namedtuple('Comp', 'label dof profiles ring')
+# layer/span place the member in the 3D view: which plate it sits in and how many plates it spans
+Comp = namedtuple('Comp', 'label dof profiles ring layer span', defaults=(0, 1))
 
 
 @dataclass
@@ -91,7 +97,7 @@ PLANETARY = GearType(
     geom=lambda v: {'R': v['R'], 'P': v['P'], 'S': v['S']},
     build=lambda k, v: planetary.PlanetaryGeometry.create(k, (v['R'], v['P'], v['S']), v['N'], b=v['b']),
     components=lambda v, a: [
-        Comp('Carrier', 'c', [a[3]], False),
+        Comp('Carrier', 'c', [a[3]], False, -1),
         Comp('Ring', 'r', [a[0]], True),
         Comp('Sun', 's', [a[2]], False),
         Comp('Planets', 'p', a[1], False),
@@ -140,13 +146,13 @@ COMPOUND_PLANETARY = GearType(
     geom=lambda v: {k: v[k] for k in ('R1', 'P1', 'S1', 'R2', 'P2', 'S2')},
     build=_cp_build,
     components=lambda v, a: [
-        Comp('Carrier', 'c', [a[0][3]], False),
-        Comp('Ring 1', 'r1', [a[0][0]], True),
-        Comp('Ring 2', 'r2', [a[1][0]], True),
-        Comp('Sun 1', 's1', [a[0][2]], False),
-        Comp('Sun 2', 's2', [a[1][2]], False),
-        Comp('Planets (stage 1)', 'p', a[0][1], False),
-        Comp('Planets (stage 2)', 'p', a[1][1], False),
+        Comp('Carrier', 'c', [a[0][3]], False, -1),
+        Comp('Ring 1', 'r1', [a[0][0]], True, 0),
+        Comp('Ring 2', 'r2', [a[1][0]], True, 1),
+        Comp('Sun 1', 's1', [a[0][2]], False, 0),
+        Comp('Sun 2', 's2', [a[1][2]], False, 1),
+        Comp('Planets (stage 1)', 'p', a[0][1], False, 0),
+        Comp('Planets (stage 2)', 'p', a[1][1], False, 1),
     ],
     code=lambda v, c: (
         "from pygeartrain.compound_planetary import CompoundPlanetary, CompoundPlanetaryGeometry\n"
@@ -195,8 +201,8 @@ CYCLOID = GearType(
     components=lambda v, a: [
         Comp('Pin ring' if v['cycloid'] == 'epi' else 'Ring', 'r', [a[0]], v['cycloid'] == 'hypo'),
         Comp('Cycloid disc', 'p', [a[1]], False),
-        Comp('Output flange', 'p', [a[3]], False),
-        Comp('Eccentric', 'c', [a[2]], False),
+        Comp('Output flange', 'p', [a[3]], False, 1),
+        Comp('Eccentric', 'c', [a[2]], False, 0, 2),
     ],
     code=lambda v, c: (
         "from pygeartrain.cycloid import Cycloid, CycloidGeometry\n"
@@ -236,11 +242,12 @@ COMPOUND_CYCLOID = GearType(
     geom=lambda v: {'P1': v['P1'], 'P2': v['P2']},
     build=_cc_build,
     components=lambda v, a: [
-        Comp('Ring 1', 'r1', [a[0][0]], v['cycloid'] == 'hypo'),
-        Comp('Ring 2', 'r2', [a[1][0]], v['cycloid'] == 'hypo'),
-        Comp('Disc 1', 'p', [a[0][1]], False),
-        Comp('Disc 2', 'p', [a[1][1]], False),
-        Comp('Eccentric', 'c', [a[0][2], a[1][2]], False),
+        Comp('Ring 1', 'r1', [a[0][0]], v['cycloid'] == 'hypo', 0),
+        Comp('Ring 2', 'r2', [a[1][0]], v['cycloid'] == 'hypo', 1),
+        Comp('Disc 1', 'p', [a[0][1]], False, 0),
+        Comp('Disc 2', 'p', [a[1][1]], False, 1),
+        Comp('Eccentric', 'c', [a[0][2]], False, 0),
+        Comp('Eccentric', 'c', [a[1][2]], False, 1),
     ],
     code=lambda v, c: (
         "from pygeartrain.compound_cycloid import CompoundCycloid, CompoundCycloidGeometry\n"
@@ -279,8 +286,8 @@ NABTESCO = GearType(
     components=lambda v, a: [
         Comp('Pin ring', 'r', [a[0][0]], False),
         Comp('Cycloid disc', 'l', [a[0][1]], False),
-        Comp('Crank gears', 'w', a[1][1], False),
-        Comp('Input sun', 's', [a[1][2]], False),
+        Comp('Crank gears', 'w', a[1][1], False, 1),
+        Comp('Input sun', 's', [a[1][2]], False, 1),
     ],
     code=lambda v, c: (
         "from pygeartrain.nabtesco import NabtescoKinematics, NabtescoGeometry\n"
@@ -342,6 +349,44 @@ GEAR_TYPES = {t.name: t for t in
 # Rendering helpers: turn pygeartrain Profiles into filled matplotlib paths
 # ----------------------------------------------------------------------------
 
+THEMES = {
+    'light': dict(bg='#F5F6F8', field='#FFFFFF', fg='#1F2937', muted='#5B6472', heading='#333333',
+                  accent='#0072B2', warn='#B45309', err='#B91C1C', border='#C9CED6', select='#DCE7F3',
+                  button='#E9ECF0', button_active='#DCE1E7', fig='#FFFFFF', axis='#333333', fill_alpha=0.28),
+    'dark': dict(bg='#1F2023', field='#2B2D31', fg='#E6E8EB', muted='#9AA3AE', heading='#C9CDD3',
+                 accent='#56B4E9', warn='#F2A33A', err='#F87171', border='#3A3D43', select='#34465A',
+                 button='#2E3136', button_active='#3A3E44', fig='#232428', axis='#C9CDD3', fill_alpha=0.36),
+}
+SETTINGS_PATH = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'pyGearTrainStudio', 'settings.json')
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2)
+    except OSError:
+        pass
+
+
+def system_prefers_dark():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as k:
+            return winreg.QueryValueEx(k, 'AppsUseLightTheme')[0] == 0
+    except (OSError, ImportError):
+        return False
+
+
 MEMBER_COLORS = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9', '#8C6D31', '#7F7F7F']
 ROLE_COLORS = {'input': '#D55E00', 'output': '#0072B2', 'fixed': '#8A8A8A', 'free': '#009E73'}
 
@@ -368,60 +413,74 @@ def signed_area(p):
     return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
 
 
+# loops: vertex index arrays into the concatenated profile vertices, solids CCW / holes CW
+# parent: for each loop the enclosing loop one level up (-1 = top level)
+LoopShape = namedtuple('LoopShape', 'loops solid parent circle extent')
+
+
+def analyse_component(comp):
+    """Work out loop structure, nesting and orientation of a member's profiles.
+
+    Rigid motion preserves all of this, so it is done once and reused every frame."""
+    verts0 = [p.vertices for p in comp.profiles]
+    offsets = np.cumsum([0] + [len(v) for v in verts0])
+    loops = []
+    for p, off in zip(comp.profiles, offsets):
+        cubes = p.topology.elements[-1]
+        if len(cubes):
+            loops.extend(l + off for l in trace_loops(cubes))
+    if not loops:
+        return None
+    allv = np.concatenate(verts0)
+
+    polys = [allv[l] for l in loops]
+    paths = [Path(p) for p in polys]
+    n = len(loops)
+    inside = np.zeros((n, n), dtype=bool)     # inside[i, j]: loop i lies within loop j
+    for i, p in enumerate(polys):
+        sample = p[np.linspace(0, len(p) - 1, 5).astype(int)]
+        for j, q in enumerate(paths):
+            inside[i, j] = i != j and np.sum(q.contains_points(sample)) >= 3
+    depth = inside.sum(axis=1)
+
+    # rings have only their toothed inner edge; give them an outer body
+    circle = None
+    radius = np.max(np.linalg.norm(allv, axis=1))
+    if comp.ring:
+        t = np.linspace(0, 2 * np.pi, 181)
+        circle = np.c_[np.cos(t), np.sin(t)] * radius * 1.08
+        depth = depth + 1
+    solid = [d % 2 == 0 for d in depth]
+    parent = []
+    for i in range(n):
+        up = [j for j in range(n) if inside[i, j] and depth[j] == depth[i] - 1]
+        parent.append(up[0] if up else -1)
+    oriented = [l if (signed_area(p) > 0) == sd else l[::-1] for l, p, sd in zip(loops, polys, solid)]
+    return LoopShape(oriented, solid, parent, circle, radius * (1.08 if comp.ring else 1.0))
+
+
 class ComponentArtist:
-    """One gear member drawn as a single compound PathPatch.
+    """One gear member drawn as a single compound PathPatch; every frame only gathers
+    the transformed vertices into the precomputed path layout, which keeps animation cheap."""
 
-    Loop structure, nesting depth and orientation are worked out once at phase 0;
-    every frame only gathers the transformed vertices, which keeps animation cheap.
-    """
-
-    def __init__(self, ax, comp, color, fill=True):
+    def __init__(self, ax, comp, color, fill=True, alpha=0.28):
         self.comp = comp
-        verts0 = [p.vertices for p in comp.profiles]
-        offsets = np.cumsum([0] + [len(v) for v in verts0])
-        loops = []
-        for p, off in zip(comp.profiles, offsets):
-            cubes = p.topology.elements[-1]
-            if len(cubes):
-                loops.extend(l + off for l in trace_loops(cubes))
-        allv = np.concatenate(verts0) if verts0 else np.zeros((0, 2))
-        self.empty = not loops
+        self.shape = analyse_component(comp)
+        self.empty = self.shape is None
         if self.empty:
             return
-
-        polys = [allv[l] for l in loops]
-        paths = [Path(p) for p in polys]
-        depth = []
-        for i, p in enumerate(polys):
-            sample = p[np.linspace(0, len(p) - 1, 5).astype(int)]
-            d = 0
-            for j, q in enumerate(paths):
-                if i != j and np.sum(q.contains_points(sample)) >= 3:
-                    d += 1
-            depth.append(d)
-
-        # rings have only their toothed inner edge; give them an outer body
-        self.circle = None
-        if comp.ring:
-            r = np.max(np.linalg.norm(allv, axis=1)) * 1.08
-            t = np.linspace(0, 2 * np.pi, 181)
-            self.circle = np.c_[np.cos(t), np.sin(t)] * r
-            depth = [d + 1 for d in depth]
-        self.extent = np.max(np.linalg.norm(allv, axis=1)) * (1.08 if comp.ring else 1.0)
-
+        self.circle = self.shape.circle
+        self.extent = self.shape.extent
         idx, codes = [], []
         if self.circle is not None:
             codes += [Path.MOVETO] + [Path.LINETO] * 179 + [Path.CLOSEPOLY]
-        for l, p, d in zip(loops, polys, depth):
-            solid = d % 2 == 0
-            if (signed_area(p) > 0) != solid:
-                l = l[::-1]
+        for l in self.shape.loops:
             idx.append(np.r_[l, l[:1]])
             codes += [Path.MOVETO] + [Path.LINETO] * (len(l) - 1) + [Path.CLOSEPOLY]
         self.idx = np.concatenate(idx)
         self.codes = np.array(codes, dtype=np.uint8)
         self.patch = PathPatch(self._path(comp.profiles), lw=1.3, joinstyle='round')
-        self.set_style(color, fill)
+        self.set_style(color, fill, alpha)
         ax.add_patch(self.patch)
 
     def _path(self, profiles):
@@ -430,9 +489,9 @@ class ComponentArtist:
             v = np.concatenate([self.circle, v])
         return Path(v, self.codes)
 
-    def set_style(self, color, fill):
+    def set_style(self, color, fill, alpha=0.28):
         self.patch.set_edgecolor(color)
-        self.patch.set_facecolor(matplotlib.colors.to_rgba(color, 0.28 if fill else 0.0))
+        self.patch.set_facecolor(matplotlib.colors.to_rgba(color, alpha if fill else 0.0))
 
     def update(self, profiles):
         if not self.empty:
@@ -454,6 +513,10 @@ class GearStudio(tk.Tk):
         icon = os.path.join(getattr(sys, '_MEIPASS', HERE), 'build_assets', 'gear.ico')
         if os.path.exists(icon):
             self.iconbitmap(icon)
+        self.settings = load_settings()
+        self.theme_pref = tk.StringVar(value=self.settings.get('theme', 'system'))
+        self.theme = THEMES['dark' if self._wants_dark() else 'light']
+        self.sweep_meta = None
         self._style()
 
         self.kin_cache = {}
@@ -469,6 +532,7 @@ class GearStudio(tk.Tk):
         self._scrubbing = False
 
         self._build_layout()
+        self.apply_theme(redraw=False)
         self.type_var.set(PLANETARY.name)
         self.on_type_change()
         self.after(int(1000 / self.FPS), self.tick)
@@ -476,22 +540,99 @@ class GearStudio(tk.Tk):
 
     # ---------------- layout ----------------
 
+    def _wants_dark(self):
+        pref = self.theme_pref.get()
+        return pref == 'dark' or (pref == 'system' and system_prefers_dark())
+
     def _style(self):
+        """Theme colours for every ttk widget; called again whenever the theme changes."""
+        t = self.theme
         s = ttk.Style(self)
         s.theme_use('clam')
-        bg = '#F5F6F8'
-        self.configure(bg=bg)
-        s.configure('.', background=bg, font=('Segoe UI', 10))
-        s.configure('Side.TFrame', background=bg)
-        s.configure('TLabelframe', background=bg)
-        s.configure('TLabelframe.Label', background=bg, font=('Segoe UI Semibold', 10), foreground='#333')
-        s.configure('Title.TLabel', font=('Segoe UI Semibold', 16), foreground='#1F2937')
-        s.configure('Muted.TLabel', foreground='#5B6472', font=('Segoe UI', 9))
-        s.configure('Ratio.TLabel', font=('Segoe UI Semibold', 20), foreground='#0072B2')
-        s.configure('Warn.TLabel', foreground='#B45309', font=('Segoe UI', 9))
-        s.configure('Err.TLabel', foreground='#B91C1C', font=('Segoe UI', 9))
+        self.configure(bg=t['bg'])
+        s.configure('.', background=t['bg'], foreground=t['fg'], font=('Segoe UI', 10), fieldbackground=t['field'],
+                    bordercolor=t['border'], lightcolor=t['bg'], darkcolor=t['bg'], troughcolor=t['field'],
+                    selectbackground=t['select'], selectforeground=t['fg'], insertcolor=t['fg'], arrowcolor=t['fg'])
+        s.configure('TFrame', background=t['bg'])
+        s.configure('Side.TFrame', background=t['bg'])
+        s.configure('TLabelframe', background=t['bg'], bordercolor=t['border'])
+        s.configure('TLabelframe.Label', background=t['bg'], font=('Segoe UI Semibold', 10), foreground=t['heading'])
+        s.configure('TLabel', background=t['bg'], foreground=t['fg'])
+        s.configure('Title.TLabel', font=('Segoe UI Semibold', 16), foreground=t['fg'])
+        s.configure('Muted.TLabel', foreground=t['muted'], font=('Segoe UI', 9))
+        s.configure('Ratio.TLabel', font=('Segoe UI Semibold', 20), foreground=t['accent'])
+        s.configure('Warn.TLabel', foreground=t['warn'], font=('Segoe UI', 9))
+        s.configure('Err.TLabel', foreground=t['err'], font=('Segoe UI', 9))
+        s.configure('TButton', background=t['button'], foreground=t['fg'], bordercolor=t['border'])
+        s.map('TButton', background=[('pressed', t['button_active']), ('active', t['button_active'])])
         s.configure('Accent.TButton', font=('Segoe UI Semibold', 10))
-        s.configure('Treeview', rowheight=24)
+        for w in ('TCombobox', 'TSpinbox', 'TEntry'):
+            s.configure(w, fieldbackground=t['field'], background=t['button'], foreground=t['fg'],
+                        arrowcolor=t['fg'], bordercolor=t['border'])
+        s.map('TCombobox', fieldbackground=[('readonly', t['field'])], foreground=[('readonly', t['fg'])],
+              selectbackground=[('readonly', t['field'])], selectforeground=[('readonly', t['fg'])],
+              background=[('active', t['button_active'])])
+        s.map('TSpinbox', background=[('active', t['button_active'])])
+        for w in ('TCheckbutton', 'TRadiobutton'):
+            s.configure(w, background=t['bg'], foreground=t['fg'], indicatorbackground=t['field'],
+                        indicatorforeground=t['fg'])
+            s.map(w, background=[('active', t['bg'])], indicatorbackground=[('pressed', t['select'])])
+        s.configure('TNotebook', background=t['bg'], bordercolor=t['border'])
+        s.configure('TNotebook.Tab', background=t['button'], foreground=t['muted'], padding=(10, 4),
+                    bordercolor=t['border'])
+        s.map('TNotebook.Tab', background=[('selected', t['field'])], foreground=[('selected', t['fg'])])
+        s.configure('Treeview', rowheight=24, background=t['field'], fieldbackground=t['field'], foreground=t['fg'])
+        s.map('Treeview', background=[('selected', t['select'])], foreground=[('selected', t['fg'])])
+        s.configure('Treeview.Heading', background=t['button'], foreground=t['fg'], bordercolor=t['border'])
+        s.map('Treeview.Heading', background=[('active', t['button_active'])])
+        s.configure('Horizontal.TScale', background=t['button'], troughcolor=t['field'], bordercolor=t['border'])
+        s.configure('Vertical.TScrollbar', background=t['button'], troughcolor=t['bg'], bordercolor=t['bg'],
+                    arrowcolor=t['fg'])
+        s.configure('TPanedwindow', background=t['border'])
+        # drop-down lists of comboboxes are plain Tk widgets, styled through the option database
+        for opt, key in (('background', 'field'), ('foreground', 'fg'),
+                         ('selectBackground', 'select'), ('selectForeground', 'fg')):
+            self.option_add(f'*TCombobox*Listbox.{opt}', t[key])
+
+    def on_theme_change(self):
+        self.settings['theme'] = self.theme_pref.get()
+        save_settings(self.settings)
+        self.theme = THEMES['dark' if self._wants_dark() else 'light']
+        self._style()
+        self.apply_theme()
+
+    def apply_theme(self, redraw=True):
+        """Push the current theme into the sidebar canvas, the title bar and every figure."""
+        t = self.theme
+        self.side_canvas.configure(bg=t['bg'])
+        matplotlib.rcParams.update({
+            'figure.facecolor': t['fig'], 'axes.facecolor': t['fig'], 'savefig.facecolor': t['fig'],
+            'text.color': t['fg'], 'axes.labelcolor': t['fg'], 'axes.edgecolor': t['axis'],
+            'xtick.color': t['axis'], 'ytick.color': t['axis'],
+        })
+        for fig in (self.fig, self.kfig, self.sfig):
+            fig.set_facecolor(t['fig'])
+        self.readout.set_color(t['fg'])
+        self.view3d.apply_theme(t)
+        self.after(10, self._titlebar)
+        if redraw and self.gear is not None:
+            self.restyle(redraw=False)
+            self.update_kinematics_tab()
+            if self.sweep_meta:
+                self.compute_sweep()
+            self.update_frame(sync_slider=False)
+            self.canvas.draw_idle()
+
+    def _titlebar(self):
+        """Ask Windows 10/11 for a dark or light title bar to match the theme."""
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1 if self.theme is THEMES['dark'] else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+            # SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED: repaint the frame now
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x1 | 0x2 | 0x4 | 0x20)
+        except (AttributeError, OSError):
+            pass
 
     def _build_layout(self):
         paned = ttk.PanedWindow(self, orient='horizontal')
@@ -499,7 +640,8 @@ class GearStudio(tk.Tk):
 
         # scrollable sidebar
         side_outer = ttk.Frame(paned, style='Side.TFrame', width=330)
-        canvas = tk.Canvas(side_outer, bg='#F5F6F8', highlightthickness=0, width=320)
+        canvas = tk.Canvas(side_outer, bg=self.theme['bg'], highlightthickness=0, width=320)
+        self.side_canvas = canvas
         sb = ttk.Scrollbar(side_outer, orient='vertical', command=canvas.yview)
         self.side = ttk.Frame(canvas, style='Side.TFrame', padding=(14, 12))
         self.side.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
@@ -516,7 +658,8 @@ class GearStudio(tk.Tk):
 
         s = self.side
         ttk.Label(s, text='pyGearTrain Studio', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(s, text='Gear train kinematics & profiles', style='Muted.TLabel').pack(anchor='w', pady=(0, 10))
+        ttk.Label(s, text=f'v{__version__} · gear train kinematics & profiles',
+                  style='Muted.TLabel').pack(anchor='w', pady=(0, 10))
 
         f = ttk.LabelFrame(s, text='Gear train', padding=8)
         f.pack(fill='x', pady=4)
@@ -559,12 +702,20 @@ class GearStudio(tk.Tk):
         self.legend_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(f, text='Filled shapes', variable=self.fill_var, command=self.restyle).pack(anchor='w')
         ttk.Checkbutton(f, text='Legend', variable=self.legend_var, command=self.restyle).pack(anchor='w')
+        row = ttk.Frame(f)
+        row.pack(fill='x', pady=(4, 0))
+        ttk.Label(row, text='Theme').pack(side='left')
+        for val, txt in (('system', 'System'), ('light', 'Light'), ('dark', 'Dark')):
+            ttk.Radiobutton(row, text=txt, value=val, variable=self.theme_pref,
+                            command=self.on_theme_change).pack(side='left', padx=4)
 
 
         # tabs
         self.nb = ttk.Notebook(main)
         self.nb.pack(fill='both', expand=True, padx=(4, 8), pady=8)
+        self.nb.bind('<<NotebookTabChanged>>', lambda e: self.update_frame(sync_slider=False))
         self._build_anim_tab()
+        self._build_3d_tab()
         self._build_kin_tab()
         self._build_sweep_tab()
 
@@ -573,10 +724,11 @@ class GearStudio(tk.Tk):
 
     def _build_anim_tab(self):
         tab = ttk.Frame(self.nb)
+        self.anim_tab = tab
         self.nb.add(tab, text='  Animation  ')
-        self.fig = Figure(figsize=(8, 7), dpi=100, facecolor='white')
+        self.fig = Figure(figsize=(8, 7), dpi=100)
         self.ax = self.fig.add_axes([0.02, 0.03, 0.70, 0.88])
-        self.readout = self.fig.text(0.02, 0.965, '', fontsize=10, family='monospace', color='#1F2937', va='top')
+        self.readout = self.fig.text(0.02, 0.965, '', fontsize=10, family='monospace', va='top')
         self.canvas = FigureCanvasTkAgg(self.fig, master=tab)
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
 
@@ -605,10 +757,22 @@ class GearStudio(tk.Tk):
         ttk.Button(bar, text='Save GIF', command=self.save_gif).pack(side='right', padx=2)
         ttk.Button(bar, text='Save PNG', command=self.save_png).pack(side='right', padx=2)
 
+    def _build_3d_tab(self):
+        self.view3d = Gear3DView(self.nb, on_status=self.set_status)
+        self.nb.add(self.view3d, text='  3D view  ')
+
+    def visible_view(self):
+        current = self.nb.select()
+        if current == str(self.anim_tab):
+            return '2d'
+        if current == str(self.view3d):
+            return '3d'
+        return None
+
     def _build_kin_tab(self):
         tab = ttk.Frame(self.nb, padding=8)
         self.nb.add(tab, text='  Kinematics  ')
-        self.kfig = Figure(figsize=(8, 4.6), dpi=100, facecolor='white')
+        self.kfig = Figure(figsize=(8, 4.6), dpi=100)
         self.kcanvas = FigureCanvasTkAgg(self.kfig, master=tab)
         self.kcanvas.get_tk_widget().pack(fill='both', expand=True)
         cols = ('member', 'role', 'sym', 'out', 'in')
@@ -647,11 +811,10 @@ class GearStudio(tk.Tk):
         ttk.Button(ctl, text='Compute', style='Accent.TButton', command=self.compute_sweep).pack(side='left')
         ttk.Label(tab, text='Uses the symbolic ratio of the current configuration. Click a point or cell to load '
                             'those tooth counts.', style='Muted.TLabel').pack(anchor='w', pady=(4, 0))
-        self.sfig = Figure(figsize=(8, 6), dpi=100, facecolor='white')
+        self.sfig = Figure(figsize=(8, 6), dpi=100)
         self.scanvas = FigureCanvasTkAgg(self.sfig, master=tab)
         self.scanvas.get_tk_widget().pack(fill='both', expand=True)
         self.scanvas.mpl_connect('button_press_event', self.on_sweep_click)
-        self.sweep_meta = None
 
     # ---------------- parameter & config widgets ----------------
 
@@ -832,14 +995,16 @@ class GearStudio(tk.Tk):
         self.artists = []
         t0 = time.perf_counter()
         for i, comp in enumerate(comps):
-            a = ComponentArtist(self.ax, comp, MEMBER_COLORS[i % len(MEMBER_COLORS)], self.fill_var.get())
+            a = ComponentArtist(self.ax, comp, MEMBER_COLORS[i % len(MEMBER_COLORS)], self.fill_var.get(),
+                                self.theme['fill_alpha'])
             if not a.empty:
                 a.zorder_index = i
                 self.artists.append(a)
         lim = max([a.extent for a in self.artists] + [1e-6]) * 1.04
         self.ax.set_xlim(-lim, lim)
         self.ax.set_ylim(-lim, lim)
-        self.comp_index = {id(c): i for i, c in enumerate(comps)}
+        self.view3d.set_scene([(a.shape, a.comp.profiles, MEMBER_COLORS[0], a.comp.layer, a.comp.span, a.comp.ring)
+                               for a in self.artists], lim)
         self.restyle(redraw=False)
 
         rmax = abs(self.ratio_in)
@@ -870,7 +1035,8 @@ class GearStudio(tk.Tk):
         if not self.artists:
             return
         for a in self.artists:
-            a.set_style(self.member_color(a), self.fill_var.get())
+            a.set_style(self.member_color(a), self.fill_var.get(), self.theme['fill_alpha'])
+        self.view3d.set_colors([self.member_color(a) for a in self.artists])
         leg = self.ax.get_legend()
         if leg:
             leg.remove()
@@ -888,6 +1054,8 @@ class GearStudio(tk.Tk):
         if redraw:
             self.canvas.draw_idle()
             self.update_kinematics_tab()
+            if self.visible_view() == '3d':
+                self.view3d.redraw()
 
     def update_sidebar(self):
         g, kin, cfg = self.gear, self.kin, self.cfg
@@ -931,7 +1099,7 @@ class GearStudio(tk.Tk):
         self.last_t = now
         if self.playing and self.gear is not None and not self._scrubbing:
             self.input_angle += 2 * np.pi * self._speed() * dt
-            if self.nb.index('current') == 0:
+            if self.visible_view():
                 self.update_frame()
         self.after(int(1000 / self.FPS), self.tick)
 
@@ -945,9 +1113,10 @@ class GearStudio(tk.Tk):
             self.set_status(f'Animation error: {e}', error=True)
             self.playing = False
             return
-        live = [c for c in comps]
-        for a in self.artists:
-            a.update(live[a.zorder_index].profiles)
+        profiles = [comps[a.zorder_index].profiles for a in self.artists]
+        for a, prof in zip(self.artists, profiles):
+            a.update(prof)
+        self.view3d.update_profiles(profiles)
         in_rev = self.input_angle / (2 * np.pi)
         out_rev = phase / (2 * np.pi)
         lab = self.spec.dof_labels
@@ -956,7 +1125,11 @@ class GearStudio(tk.Tk):
         if sync_slider:
             span = max(1.0, abs(self.ratio_in))
             self.pos_var.set(in_rev % span)
-        self.canvas.draw_idle()
+        view = self.visible_view()
+        if view == '2d':
+            self.canvas.draw_idle()
+        elif view == '3d':
+            self.view3d.redraw()
 
     # ---------------- kinematics tab ----------------
 
@@ -979,7 +1152,7 @@ class GearStudio(tk.Tk):
         except Exception:
             txt = f'{cfg[0]}/{cfg[1]} = {kin.ratio} = {g.ratio}'
         tax.text(0.0, 0.5, txt, fontsize=17, va='center', transform=tax.transAxes)
-        tax.set_title('Gear ratio (input / output)', loc='left', fontsize=11, color='#5B6472')
+        tax.set_title('Gear ratio (input / output)', loc='left', fontsize=11, color=self.theme['muted'])
 
         bax = self.kfig.add_subplot(gs[1])
         dofs = sorted(g.ratios_f, key=lambda d: (d != cfg[0], d != cfg[1], d))
@@ -988,19 +1161,19 @@ class GearStudio(tk.Tk):
         y = np.arange(len(dofs))[::-1]
         bax.barh(y, speeds, color=colors, alpha=0.85, height=0.6)
         bax.set_yticks(y, [f'{lab.get(d, d)}  [{d}]' for d in dofs])
-        bax.axvline(0, color='#333', lw=0.8)
+        bax.axvline(0, color=self.theme['axis'], lw=0.8)
         nz = [abs(s) for s in speeds if abs(s) > 1e-12]
         if nz and max(nz) / min(nz) > 50:
             bax.set_xscale('symlog', linthresh=min(nz))
         for yi, s in zip(y, speeds):
             bax.annotate(f'{s:+.4g}', (s, yi), xytext=(4 if s >= 0 else -4, 0), textcoords='offset points',
-                         ha='left' if s >= 0 else 'right', va='center', fontsize=9, color='#1F2937', clip_on=False)
+                         ha='left' if s >= 0 else 'right', va='center', fontsize=9, color=self.theme['fg'], clip_on=False)
         lo, hi = min(speeds + [0]), max(speeds + [0])
         pad = (hi - lo) * 0.18 or 1
         if bax.get_xscale() == 'linear':
             bax.set_xlim(lo - pad, hi + pad)
         bax.set_xlabel('Revolutions per input revolution (fixed-frame)')
-        bax.set_title('Member speeds', loc='left', fontsize=11, color='#5B6472')
+        bax.set_title('Member speeds', loc='left', fontsize=11, color=self.theme['muted'])
         bax.legend(handles=[Line2D([], [], color=c, lw=8, label=r) for r, c in ROLE_COLORS.items()],
                    loc='lower right', bbox_to_anchor=(1.0, 1.0), fontsize=8, frameon=False, ncol=4)
         for sp in ('top', 'right'):
@@ -1061,8 +1234,8 @@ class GearStudio(tk.Tk):
         if not two_d:
             z = Z[0]
             ax.plot(xs, z, color='#9CA3AF', lw=1, zorder=1)
-            ax.scatter(xs[valid[0]], z[valid[0]], color='#0072B2', s=28, zorder=2, label='valid geometry')
-            ax.scatter(xs[~valid[0]], z[~valid[0]], facecolor='white', edgecolor='#9CA3AF', s=28, zorder=2,
+            ax.scatter(xs[valid[0]], z[valid[0]], color=self.theme['accent'], s=28, zorder=2, label='valid geometry')
+            ax.scatter(xs[~valid[0]], z[~valid[0]], facecolor=self.theme['fig'], edgecolor='#9CA3AF', s=28, zorder=2,
                        label='mesh constraint violated')
             if xs[0] <= cur[0] <= xs[-1]:
                 ax.scatter([cur[0]], [self.ratio_in], color='#D55E00', s=90, marker='*', zorder=3, label='current')
@@ -1084,7 +1257,7 @@ class GearStudio(tk.Tk):
             cb.set_label('log10 |ratio|')
             if not self.valid_only.get() and (~valid).any():
                 shade = np.zeros(Z.shape + (4,))
-                shade[~valid] = (1, 1, 1, 0.65)
+                shade[~valid] = (*matplotlib.colors.to_rgb(self.theme['fig']), 0.7)
                 ax.imshow(shade, origin='lower', extent=ext, aspect='auto', interpolation='nearest')
             if Z.size <= 150:
                 for j, yv in enumerate(ys):
@@ -1097,7 +1270,7 @@ class GearStudio(tk.Tk):
             ax.set_xlabel(xn)
             ax.set_ylabel(yn)
             ax.set_title('Faded cells violate a mesh constraint' if (~valid).any() and not self.valid_only.get()
-                         else '', fontsize=9, color='#5B6472', loc='left')
+                         else '', fontsize=9, color=self.theme['muted'], loc='left')
         self.sfig.suptitle(f'{spec.name}: ratio {self.cfg[0]}/{self.cfg[1]} = {sympy.sstr(kin.ratio)}',
                            fontsize=11, x=0.02, ha='left')
         ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
@@ -1125,7 +1298,7 @@ class GearStudio(tk.Tk):
         fn = filedialog.asksaveasfilename(defaultextension='.png', filetypes=[('PNG image', '*.png')],
                                           initialfile=f'{self.spec.name.replace(" ", "_").lower()}.png')
         if fn:
-            self.fig.savefig(fn, dpi=150, facecolor='white')
+            self.fig.savefig(fn, dpi=150, facecolor=self.fig.get_facecolor())
             self.set_status(f'Saved {fn}')
 
     def save_gif(self):
@@ -1167,7 +1340,7 @@ class GearStudio(tk.Tk):
         self.set_status('Copied an equivalent pygeartrain script to the clipboard.')
 
     def set_status(self, msg, error=False):
-        self.status.configure(text=msg, foreground='#B91C1C' if error else '#5B6472')
+        self.status.configure(text=msg, foreground=self.theme['err'] if error else self.theme['muted'])
 
 
 if __name__ == '__main__':

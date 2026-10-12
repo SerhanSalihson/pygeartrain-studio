@@ -1,10 +1,10 @@
 # pyGearTrain Studio
 
 A desktop GUI for [pygeartrain](https://github.com/EelcoHoogendoorn/pyGearTrain) by Eelco Hoogendoorn:
-build planetary, compound planetary, cycloidal and RV-style gear trains, watch them run, and explore
-their kinematics.
+build planetary, compound planetary, cycloidal and RV-style gear trains, watch them run in 2D or 3D,
+and explore their kinematics.
 
-![Compound planetary](docs/compound_planetary.png)
+![3D view, dark theme](docs/window_dark_3d.png)
 
 ## Download
 
@@ -18,6 +18,11 @@ Windows SmartScreen may warn because the exe is unsigned: choose *More info → 
   Nabtesco/RV reducer, simple gear pair and nested gerotor, with presets taken from pygeartrain's examples.
 - **Any configuration**: choose input, output and fixed members, or type a linear constraint such as
   `r1-r2` to fuse two members.
+- **3D view** *(new in 1.1)*: every member extruded into a plate and stacked by stage, animated in sync
+  with the 2D view. Drag to rotate, scroll to zoom, adjust plate thickness, explode the stages apart,
+  pick a detail level, see through the ring gears with x-ray mode, and save PNGs.
+- **Dark mode** *(new in 1.1)*: System / Light / Dark theme covering the whole UI, every plot and the
+  Windows title bar. The choice is remembered.
 - **Live animation** with filled profiles, colouring by member or by role (input / output / fixed / free),
   speed control, a position scrubber and revolution counters.
 - **Kinematics view**: the symbolic gear ratio rendered as an equation, a speed bar chart and a table of
@@ -34,6 +39,8 @@ Windows SmartScreen may warn because the exe is unsigned: choose *More info → 
 | Nabtesco / RV | Cycloidal drive, coloured by role |
 |---|---|
 | ![Nabtesco](docs/nabtesco.png) | ![Cycloid](docs/cycloid.png) |
+
+![Light theme, 2D animation](docs/window_light_2d.png)
 
 ## Running from source
 
@@ -53,6 +60,7 @@ LICENSE). Its dependencies need some care, all handled by `setup_env.ps1`:
 
 - `numga` is pinned to the last commit before its 2.0 rewrite, which removed the API pygeartrain uses.
   That version requires numpy 1.x, so scipy and matplotlib are pinned to matching releases.
+- The 3D cap triangulation uses `shapely.constrained_delaunay_triangles`, so Shapely 2.1 or newer is needed.
 - `pycomplex` depends on `fastcache` and `pycosat`, which need a C compiler on Windows. `fastcache` is
   replaced by a one-line `functools.lru_cache` shim, and `pycosat` (only used for 3D mesh orientation)
   by a stub.

@@ -8,7 +8,7 @@ Set-Location $PSScriptRoot
 $py = Join-Path $Venv 'Scripts\python.exe'
 & $py -m pip install --upgrade pip
 # old numga requires numpy 1.x, so pin a matching scipy / matplotlib
-& $py -m pip install "numpy==1.26.4" "scipy==1.13.1" "matplotlib==3.8.4" "contourpy<1.4" "shapely==2.0.6" `
+& $py -m pip install "numpy==1.26.4" "scipy==1.13.1" "matplotlib==3.8.4" "contourpy<1.4" "shapely>=2.1,<2.3" `
     sympy pillow cached_property numpy_indexed funcsigs pyinstaller
 # pygeartrain targets the pre-2.0 numga API (numga.backend.numpy.context); pin the last commit before the rewrite
 & $py -m pip install --no-deps "git+https://github.com/eelcohoogendoorn/numga.git@fe9f0ff69fdf8fc3430544eb76431729d2cdbcb3"
