@@ -30,6 +30,11 @@ Windows SmartScreen may warn because the exe is unsigned: choose *More info → 
 - **Ratio sweep**: 1D plots or 2D heatmaps of the ratio over tooth-count ranges, with geometrically
   invalid combinations faded out. Click a cell to load it.
 - **Meshing checks** (e.g. R = S + 2P, evenly spaceable planets).
+- **Involute check** for planetaries: enter module, pressure angle and profile shifts, and the app checks
+  that the tooth counts work as real involute gears with hobbed sun/planets and a skived ring. It checks
+  undercut (by simulating rack generation), ring tip vs planet root interference (and reports the minimum
+  ring tip Ø), equal centre distances, contact ratios and pointed tips. `involute_check.py`, with tests
+  in `tests/`.
 - **Export** PNG frames and GIF animations, or copy an equivalent pygeartrain script to the clipboard.
 
 | Kinematics | Ratio sweep |

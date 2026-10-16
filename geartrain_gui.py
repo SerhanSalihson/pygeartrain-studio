@@ -33,6 +33,7 @@ import matplotlib.ticker
 
 from pygeartrain import planetary, compound_planetary, cycloid, compound_cycloid, nabtesco, simple
 from viewer3d import Gear3DView
+from involute_check import check_planetary
 
 __version__ = '1.1.0'
 
@@ -62,6 +63,7 @@ class GearType:
     presets: dict = field(default_factory=dict)
     sweep_axes: tuple = ()      # default (x, y) parameters for the ratio sweep
     derive: Callable = None     # values -> values with dependent tooth counts filled in
+    involute: Callable = None   # values -> (S, P, R, N) for the involute manufacturability check
 
     @property
     def n_constraints(self):
@@ -110,6 +112,7 @@ PLANETARY = GearType(
     checks=lambda v: planetary_checks(v['R'], v['P'], v['S'], v['N']),
     sweep_axes=('P', 'S'),
     derive=lambda v: {**v, 'R': v['S'] + 2 * v['P']},
+    involute=lambda v: (v['S'], v['P'], v['R'], v['N']),
     presets={
         'Classic 14/4/6, 5 planets': ({'R': 14, 'P': 4, 'S': 6, 'N': 5, 'b': 0.8}, ('s', 'c', 'r')),
         '11/2/7, 6 planets': ({'R': 11, 'P': 2, 'S': 7, 'N': 6, 'b': 0.6}, ('s', 'c', 'r')),
@@ -683,6 +686,8 @@ class GearStudio(tk.Tk):
         self.ratio_sub.pack(anchor='w', fill='x')
         self.warn_lbl = ttk.Label(f, style='Warn.TLabel', wraplength=280, justify='left')
         self.warn_lbl.pack(anchor='w', fill='x', pady=(6, 0))
+        self.result_frame = f
+        self._build_involute_frame(s)
 
         self.param_frame = ttk.LabelFrame(s, text='Geometry', padding=8)
         self.param_frame.pack(fill='x', pady=4)
@@ -822,6 +827,10 @@ class GearStudio(tk.Tk):
         self.spec = GEAR_TYPES[self.type_var.get()]
         spec = self.spec
         self.desc_lbl.configure(text=spec.description)
+        if spec.involute:
+            self.inv_frame.pack(fill='x', pady=4, after=self.result_frame)
+        else:
+            self.inv_frame.pack_forget()
         self.preset_cb.configure(values=list(spec.presets) or ['(none)'])
         self.preset_var.set('')
 
@@ -1070,6 +1079,88 @@ class GearStudio(tk.Tk):
                                       + ('\nNegative: output turns opposite to input.' if r < 0 else ''))
         warns = self.spec.checks(self.vals)
         self.warn_lbl.configure(text='\n'.join('⚠ ' + w for w in warns))
+        self.update_involute()
+
+    # ---------------- involute check ----------------
+
+    INV_FIELDS = (('m', 'Module m [mm]', 0.5, 0.05, 20, 0.05),
+                  ('alpha', 'Pressure angle α [°]', 20.0, 14.5, 30, 0.5),
+                  ('xs', 'Profile shift x sun', 0.0, -1.0, 1.5, 0.05),
+                  ('xp', 'Profile shift x planet', 0.0, -1.5, 1.5, 0.05),
+                  ('xr', 'Profile shift x ring', 0.0, -1.5, 1.5, 0.05),
+                  ('ring_tip', 'Ring tip Ø [mm] (0 = std)', 0.0, 0.0, 5000, 0.01))
+
+    def _build_involute_frame(self, parent):
+        f = ttk.LabelFrame(parent, text='Involute check (hob / skive)', padding=8)
+        self.inv_frame = f
+        self._inv_pending = None
+        saved = self.settings.get('involute', {})
+        self.inv_vars, self.inv_widgets = {}, {}
+        for i, (k, lab, d, lo, hi, st) in enumerate(self.INV_FIELDS):
+            ttk.Label(f, text=lab).grid(row=i, column=0, sticky='w', pady=2)
+            var = tk.StringVar(value=str(saved.get(k, d)))
+            w = ttk.Spinbox(f, textvariable=var, from_=lo, to=hi, increment=st, width=9)
+            w.grid(row=i, column=1, sticky='e', pady=2)
+            var.trace_add('write', lambda *a: self.schedule_involute())
+            self.inv_vars[k], self.inv_widgets[k] = var, w
+        n = len(self.INV_FIELDS)
+        self.inv_zero_sum = tk.BooleanVar(value=saved.get('zero_sum', True))
+        ttk.Checkbutton(f, text='Zero-sum shifts (x_p = −x_s, x_r = x_p)', variable=self.inv_zero_sum,
+                        command=self.schedule_involute).grid(row=n, column=0, columnspan=2, sticky='w')
+        self.inv_err = ttk.Label(f, style='Err.TLabel', wraplength=280, justify='left')
+        self.inv_warn = ttk.Label(f, style='Warn.TLabel', wraplength=280, justify='left')
+        self.inv_info = ttk.Label(f, style='Muted.TLabel', wraplength=280, justify='left')
+        for i, w in enumerate((self.inv_err, self.inv_warn, self.inv_info)):
+            w.grid(row=n + 1 + i, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Label(f, style='Muted.TLabel', wraplength=280, justify='left',
+                  text='Treats the tooth counts as involute gears, hobbed (sun, planets) and '
+                       'skived (ring): undercut, ring tip / planet root interference, centre '
+                       'distance, contact ratio, pointed tips. Independent of the epi/hypo '
+                       'profiles drawn here.'
+                  ).grid(row=n + 4, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        f.columnconfigure(0, weight=1)
+
+    def schedule_involute(self, delay=300):
+        if self._inv_pending:
+            self.after_cancel(self._inv_pending)
+        self._inv_pending = self.after(delay, self.update_involute)
+
+    def update_involute(self):
+        self._inv_pending = None
+        spec = self.spec
+        if not spec or not spec.involute or self.gear is None:
+            return
+        zs = self.inv_zero_sum.get()
+        for k in ('xp', 'xr'):
+            self.inv_widgets[k].configure(state='disabled' if zs else 'normal')
+        try:
+            v = {k: float(var.get()) for k, var in self.inv_vars.items()}
+        except ValueError:
+            self.inv_err.configure(text='⛔ Enter a number in every involute field.')
+            self.inv_warn.configure(text='')
+            self.inv_info.configure(text='')
+            return
+        if zs:
+            v['xp'] = -v['xs']
+            v['xr'] = v['xp']
+            for k in ('xp', 'xr'):
+                txt = f"{v[k]:g}"
+                if self.inv_vars[k].get() != txt:
+                    self.inv_vars[k].set(txt)
+        S, P, R, N = spec.involute(self.vals)
+        try:
+            issues, info = check_planetary(S, P, R, N, v['m'], v['alpha'], v['xs'], v['xp'], v['xr'],
+                                           v['ring_tip'])
+        except Exception as e:
+            issues, info = (('error', f'Check failed: {e}'),), ()
+        self.inv_err.configure(text='\n'.join('⛔ ' + t for lvl, t in issues if lvl == 'error'))
+        self.inv_warn.configure(text='\n'.join('⚠ ' + t for lvl, t in issues if lvl == 'warn'))
+        ok = '' if issues else '✓ Works as involute gears (hob + skive).\n'
+        self.inv_info.configure(text=ok + '\n'.join(info))
+        for w in (self.inv_err, self.inv_warn):
+            w.grid() if w.cget('text') else w.grid_remove()
+        self.settings['involute'] = {**v, 'zero_sum': zs}
+        save_settings(self.settings)
 
     # ---------------- animation ----------------
 
