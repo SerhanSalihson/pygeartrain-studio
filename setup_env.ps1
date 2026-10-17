@@ -8,8 +8,8 @@ Set-Location $PSScriptRoot
 $py = Join-Path $Venv 'Scripts\python.exe'
 & $py -m pip install --upgrade pip
 # old numga requires numpy 1.x, so pin a matching scipy / matplotlib
-& $py -m pip install "numpy==1.26.4" "scipy==1.13.1" "matplotlib==3.8.4" "contourpy<1.4" "shapely>=2.1,<2.3" `
-    sympy pillow cached_property numpy_indexed funcsigs pyinstaller
+& $py -m pip install "numpy==1.26.4" "scipy==1.13.1" "matplotlib==3.8.4" "contourpy<1.4" "shapely>=2.1,<2.3" "PySide6==6.12.0" `
+    sympy pillow cached_property numpy_indexed funcsigs pyinstaller pytest
 # pygeartrain targets the pre-2.0 numga API (numga.backend.numpy.context); pin the last commit before the rewrite
 & $py -m pip install --no-deps "git+https://github.com/eelcohoogendoorn/numga.git@fe9f0ff69fdf8fc3430544eb76431729d2cdbcb3"
 # pycomplex wants fastcache and pycosat, which need MSVC to build; neither is used for 2D gear profiles
@@ -20,4 +20,4 @@ Set-Content -Path (Join-Path $site 'pycosat.py') -Encoding ascii -Value @'
 def solve(*args, **kwargs):
     raise NotImplementedError("pycosat is stubbed out in this build")
 '@
-Write-Host "Done. Run the app with: $py geartrain_gui.py   (or build the exe with build_exe.ps1)"
+Write-Host "Done. Run the app with run_gui.bat (or: $py -m gearstudio), build the downloads with build_exe.ps1"
